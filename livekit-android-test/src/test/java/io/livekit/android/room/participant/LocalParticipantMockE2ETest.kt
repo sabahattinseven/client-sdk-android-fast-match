@@ -64,6 +64,7 @@ import livekit.LivekitRtc
 import livekit.LivekitRtc.SubscribedCodec
 import livekit.LivekitRtc.SubscribedQuality
 import livekit.org.webrtc.RtpParameters
+import livekit.org.webrtc.VideoCapturer
 import livekit.org.webrtc.VideoSource
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -74,6 +75,7 @@ import org.junit.runner.RunWith
 import org.mockito.Mockito
 import org.mockito.Mockito.mock
 import org.mockito.kotlin.argThat
+import org.mockito.kotlin.whenever
 import org.robolectric.RobolectricTestRunner
 import org.robolectric.Shadows
 import kotlin.time.Duration.Companion.seconds
@@ -282,6 +284,44 @@ class LocalParticipantMockE2ETest : MockE2ETest() {
     }
 
     @Test
+    fun unpublishSurvivesInvalidatedTransceiver() = runTest {
+        connect()
+        val videoTrack = createLocalTrack()
+        room.localParticipant.publishVideoTrack(videoTrack)
+
+        // Simulate a wrapper invalidated by an intervening getTransceivers()/getSenders() call,
+        // which disposes all previously returned transceiver objects.
+        val transceiver = getPublisherPeerConnection().transceivers.first()
+        whenever(transceiver.isStopped).thenThrow(IllegalStateException("RtpTransceiver has been disposed."))
+
+        room.localParticipant.unpublishTrack(videoTrack)
+
+        assertEquals(0, room.localParticipant.videoTrackPublications.size)
+    }
+
+    @Test
+    fun disposeIsIdempotent() {
+        val source = mock(VideoSource::class.java)
+        val videoTrack = createLocalTrack(source = source)
+
+        videoTrack.dispose()
+        videoTrack.dispose()
+
+        Mockito.verify(source, Mockito.times(1)).dispose()
+    }
+
+    @Test
+    fun startCaptureAfterDisposeIsIgnored() {
+        val capturer = mock(VideoCapturer::class.java)
+        val videoTrack = createLocalTrack(capturer = capturer)
+
+        videoTrack.dispose()
+        videoTrack.startCapture()
+
+        Mockito.verify(capturer, Mockito.never()).startCapture(Mockito.anyInt(), Mockito.anyInt(), Mockito.anyInt())
+    }
+
+    @Test
     fun updateMetadata() = runTest {
         connect()
         val newMetadata = "new_metadata"
@@ -385,8 +425,9 @@ class LocalParticipantMockE2ETest : MockE2ETest() {
         height: Int = 720,
         isScreencast: Boolean = false,
         source: VideoSource = mock(VideoSource::class.java),
+        capturer: VideoCapturer = MockVideoCapturer(),
     ) = LocalVideoTrack(
-        capturer = MockVideoCapturer(),
+        capturer = capturer,
         source = source,
         name = "",
         options = LocalVideoTrackOptions(

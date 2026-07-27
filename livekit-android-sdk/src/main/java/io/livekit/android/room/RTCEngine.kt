@@ -1507,8 +1507,17 @@ internal constructor(
         runBlocking {
             publisher?.withPeerConnection {
                 for (transceiver in transceivers) {
-                    if (!transceiver.isStopped) {
-                        transceiver.stopInternal()
+                    // The transceiver wrappers are transient and may have been invalidated by an
+                    // intervening getTransceivers()/getSenders() call (see PeerConnectionResource),
+                    // in which case any use throws IllegalStateException. Skipping is safe — the
+                    // native transceiver is released when the peer connection closes — and this
+                    // runs on teardown paths (e.g. Room cleanup) which must never throw.
+                    try {
+                        if (!transceiver.isStopped) {
+                            transceiver.stopInternal()
+                        }
+                    } catch (e: Exception) {
+                        LKLog.w(e) { "Failed to stop transceiver, skipping." }
                     }
                 }
             }

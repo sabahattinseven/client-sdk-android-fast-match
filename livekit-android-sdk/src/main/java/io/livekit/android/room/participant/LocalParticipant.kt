@@ -1338,8 +1338,15 @@ internal constructor(
             val track = pub.track
 
             if (track != null) {
-                track.stop()
-                unpublishTrack(track, stopOnUnpublish = false)
+                // Stopping and unpublishing go through the engine and the webrtc layer, either
+                // of which can throw if the underlying objects were already released. Cleanup
+                // must carry on to the remaining tracks regardless.
+                try {
+                    track.stop()
+                    unpublishTrack(track, stopOnUnpublish = false)
+                } catch (e: Exception) {
+                    LKLog.d(e) { "Exception thrown when unpublishing local participant track $pub:" }
+                }
 
                 // We have the original track object reference, meaning we own it. Dispose here.
                 try {

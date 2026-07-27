@@ -55,6 +55,7 @@ import livekit.org.webrtc.VideoProcessor
 import livekit.org.webrtc.VideoSink
 import livekit.org.webrtc.VideoSource
 import java.util.UUID
+import java.util.concurrent.atomic.AtomicBoolean
 import livekit.LivekitModels.VideoQuality as ProtoVideoQuality
 
 /**
@@ -121,10 +122,16 @@ constructor(
 
     private val closeableManager = CloseableManager()
 
+    private val disposed = AtomicBoolean(false)
+
     /**
      * Starts the [capturer] with the capture params contained in [options].
      */
     open fun startCapture() {
+        if (disposed.get()) {
+            LKLog.w { "startCapture() called on a disposed track, ignoring." }
+            return
+        }
         capturer.startCapture(
             options.captureParams.width,
             options.captureParams.height,
@@ -136,6 +143,10 @@ constructor(
      * Stops the [capturer].
      */
     open fun stopCapture() {
+        if (disposed.get()) {
+            LKLog.w { "stopCapture() called on a disposed track, ignoring." }
+            return
+        }
         capturer.stopCapture()
     }
 
@@ -145,10 +156,21 @@ constructor(
     }
 
     override fun dispose() {
+        // dispose() can be reached more than once (e.g. Room cleanup on disconnect and again
+        // through release() or app-side ownership), but VideoSource.dispose() does not tolerate
+        // repeat calls, so only the first caller tears down.
+        if (!disposed.compareAndSet(false, true)) {
+            return
+        }
         super.dispose()
         capturer.dispose()
-        source.dispose()
+        // Close frame-delivery resources (SurfaceTextureHelper) before disposing the source:
+        // stopListening() synchronously halts frame dispatch, guaranteeing no in-flight frame
+        // reaches the source's native capturerObserver after its native memory is freed below.
+        // The capturer's session teardown is asynchronous, so capturer.dispose() alone leaves
+        // a use-after-free window.
         closeableManager.close()
+        source.dispose()
     }
 
     override fun addRenderer(renderer: VideoSink) {
