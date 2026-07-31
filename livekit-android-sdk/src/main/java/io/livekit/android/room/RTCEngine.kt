@@ -530,11 +530,13 @@ internal constructor(
                 configurationLock.withLock {
                     publisherObserver.connectionChangeListener = null
                     subscriberObserver.connectionChangeListener = null
-                    publisher?.closeBlocking()
-                    publisher = null
-                    subscriber?.closeBlocking()
-                    subscriber = null
 
+                    // Data channels must go down before the peer connections:
+                    // disposing a PeerConnection tears down its SCTP transport on
+                    // the network thread, firing state/buffered-amount callbacks
+                    // into any still-registered observers whose calls back into the
+                    // mid-teardown native channel crash (disengaged-optional abort
+                    // on network_thread).
                     reliableBufferedAmountJob?.cancel()
                     reliableBufferedAmountJob = null
                     reliableDataChannelManager?.dispose()
@@ -549,6 +551,11 @@ internal constructor(
                     lossyDataChannelSubManager?.dispose()
                     lossyDataChannelSubManager = null
                     lossyDataChannelSub = null
+
+                    publisher?.closeBlocking()
+                    publisher = null
+                    subscriber?.closeBlocking()
+                    subscriber = null
                     isSubscriberPrimary = false
                 }
             }

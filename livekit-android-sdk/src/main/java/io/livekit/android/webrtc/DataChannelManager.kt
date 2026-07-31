@@ -58,15 +58,32 @@ class DataChannelManager(
             .collect()
     }
 
+    // Callbacks arrive on the webrtc network thread and may race [dispose]'s
+    // unregisterObserver. Once disposal has begun, calling back into the native
+    // channel is unsafe (it may be mid-teardown), so bail out first.
+
     override fun onBufferedAmountChange(previousAmount: Long) {
-        bufferedAmount = dataChannel.bufferedAmount()
+        synchronized(this) {
+            if (disposed) {
+                return
+            }
+            bufferedAmount = dataChannel.bufferedAmount()
+        }
     }
 
     override fun onStateChange() {
-        state = dataChannel.state()
+        synchronized(this) {
+            if (disposed) {
+                return
+            }
+            state = dataChannel.state()
+        }
     }
 
     override fun onMessage(buffer: DataChannel.Buffer) {
+        if (disposed) {
+            return
+        }
         dataMessageListener.onMessage(buffer)
     }
 
