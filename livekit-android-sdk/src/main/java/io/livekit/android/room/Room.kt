@@ -630,32 +630,26 @@ constructor(
             ensureActive()
             networkCallbackManager.registerCallback()
             // Audio and video publishes are independent; run them concurrently so
-            // neither's signal round-trip delays the other.
+            // neither's signal round-trip delays the other. Each goes through
+            // setMicrophoneEnabled/setCameraEnabled rather than publishing directly,
+            // so it serializes on the per-source publish lock with any concurrent
+            // enable calls from the app once the room state flips to CONNECTED.
             coroutineScope {
                 if (options.audio) {
                     launch {
-                        val audioTrack = localParticipant.getOrCreateDefaultAudioTrack()
-                        audioTrack.prewarm()
                         var cancelPreconnect: (() -> Unit)? = null
 
                         if (audioTrackPublishDefaults.preconnect) {
                             cancelPreconnect = startPreconnectAudioJob(roomScope = this@Room.coroutineScope)
                         }
-                        if (!localParticipant.publishAudioTrack(audioTrack)) {
-                            audioTrack.stop()
-                            audioTrack.stopPrewarm()
+                        if (!localParticipant.setMicrophoneEnabled(true)) {
                             cancelPreconnect?.invoke()
                         }
                     }
                 }
                 if (options.video) {
                     launch {
-                        val videoTrack = localParticipant.getOrCreateDefaultVideoTrack()
-                        videoTrack.startCapture()
-                        if (!localParticipant.publishVideoTrack(videoTrack)) {
-                            videoTrack.stopCapture()
-                            videoTrack.stop()
-                        }
+                        localParticipant.setCameraEnabled(true)
                     }
                 }
             }
