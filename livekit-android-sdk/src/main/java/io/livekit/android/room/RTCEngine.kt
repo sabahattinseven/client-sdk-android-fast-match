@@ -44,6 +44,7 @@ import io.livekit.android.util.Either
 import io.livekit.android.util.FlowObservable
 import io.livekit.android.util.LKLog
 import io.livekit.android.util.TTLMap
+import io.livekit.android.util.TimeoutException
 import io.livekit.android.util.flow
 import io.livekit.android.util.flowDelegate
 import io.livekit.android.util.nullSafe
@@ -67,6 +68,7 @@ import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.ensureActive
+import kotlinx.coroutines.job
 import kotlinx.coroutines.joinAll
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
@@ -300,8 +302,10 @@ internal constructor(
             reconnectingJob = null
             fullReconnectOnNext = false
             abortPendingPublishTracks()
-            coroutineScope.close()
+            val oldScope = coroutineScope
+            oldScope.close()
             coroutineScope = CloseableCoroutineScope(SupervisorJob() + ioDispatcher)
+            drainInFlightJobs(oldScope, excluding = null)
             closeResources("Switching room")
             synchronized(reliableStateLock) {
                 reliableDataSequence = 1
@@ -503,9 +507,16 @@ internal constructor(
         }
         LKLog.v { "Close - $reason" }
         isClosed = true
-        reconnectingJob?.cancel()
+        val reconnectJob = reconnectingJob
+        reconnectJob?.cancel()
         reconnectingJob = null
-        coroutineScope.close()
+        val oldScope = coroutineScope
+        oldScope.close()
+        // Excluding the reconnect job: reconnect failure calls close() from
+        // within it, and joining it here would self-deadlock.
+        runBlocking {
+            drainInFlightJobs(oldScope, excluding = reconnectJob)
+        }
         hasPublished = false
         sessionUrl = null
         sessionToken = null
@@ -569,6 +580,27 @@ internal constructor(
                 it.resumeWithException(TrackException.PublishException("pending track aborted"))
             }
             pendingTrackResolvers.clear()
+        }
+    }
+
+    /**
+     * Waits for the in-flight coroutines of a just-closed scope (e.g. a server
+     * offer mid setRemoteDescription/createAnswer) to unwind before the peer
+     * connections are disposed — disposing while a native SDP operation is still
+     * executing crashes on the webrtc network thread. Bounded so teardown can
+     * never hang on a native operation that fails to complete.
+     */
+    private suspend fun drainInFlightJobs(scope: CloseableCoroutineScope, excluding: Job?) {
+        val inFlight = scope.coroutineContext.job.children.filter { it !== excluding }.toList()
+        if (inFlight.isEmpty()) {
+            return
+        }
+        try {
+            withDeadline(TEARDOWN_DRAIN_TIMEOUT) {
+                inFlight.forEach { it.join() }
+            }
+        } catch (e: TimeoutException) {
+            LKLog.w(e) { "Timed out waiting for in-flight engine work to finish before teardown." }
         }
     }
 
@@ -1129,6 +1161,7 @@ internal constructor(
         private const val MAX_RECONNECT_RETRIES = 30
         private const val MAX_RECONNECT_TIMEOUT = 60 * 1000
         private const val MAX_ICE_CONNECT_TIMEOUT_MS = 20000
+        private val TEARDOWN_DRAIN_TIMEOUT = 1.seconds
 
         private const val DATA_CHANNEL_LOW_THRESHOLD = 2 * 1024 * 1024 // 2 MB
 

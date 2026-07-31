@@ -18,7 +18,6 @@ package io.livekit.android.room.util
 
 import io.livekit.android.util.Either
 import kotlinx.coroutines.runBlocking
-import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import livekit.org.webrtc.MediaConstraints
@@ -97,7 +96,11 @@ internal open class CoroutineSdpObserver : SdpObserver {
         setOutcome = Either.Right(message)
     }
 
-    suspend fun awaitCreate() = suspendCancellableCoroutine { cont ->
+    // Deliberately non-cancellable (like [awaitSet]): the native operation is
+    // already executing, and abandoning the wait would let callers proceed to
+    // dispose the peer connection underneath it. Cancellation takes effect once
+    // the native operation completes.
+    suspend fun awaitCreate() = suspendCoroutine { cont ->
         val unlockedOutcome = createOutcome
         if (unlockedOutcome != null) {
             cont.resume(unlockedOutcome)
