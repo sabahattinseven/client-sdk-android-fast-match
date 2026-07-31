@@ -144,13 +144,14 @@ class RemoteParticipant(
     /**
      * @suppress
      */
+    @Suppress("LongParameterList")
     fun addSubscribedMediaTrack(
         mediaTrack: MediaStreamTrack,
         sid: String,
         statsGetter: RTCStatsGetter,
         receiver: RtpReceiver,
         autoManageVideo: Boolean = false,
-        triesLeft: Int = 20,
+        triesLeft: Int = MEDIA_TRACK_MAX_RETRIES,
     ) {
         val publication = getTrackPublication(sid)
 
@@ -165,7 +166,11 @@ class RemoteParticipant(
                 eventBus.postEvent(ParticipantEvent.TrackSubscriptionFailed(this, sid, exception), scope)
             } else {
                 coroutineScope.launch {
-                    delay(150)
+                    // Progressive backoff: media commonly beats the publication
+                    // metadata right after a fast (re)join, so short first
+                    // retries keep time-to-first-frame low.
+                    val attempt = MEDIA_TRACK_MAX_RETRIES - triesLeft
+                    delay(MEDIA_TRACK_RETRY_DELAYS_MS.getOrElse(attempt) { MEDIA_TRACK_MAX_RETRY_DELAY_MS })
                     addSubscribedMediaTrack(mediaTrack, sid, statsGetter, receiver = receiver, autoManageVideo, triesLeft - 1)
                 }
             }
@@ -202,7 +207,7 @@ class RemoteParticipant(
 
     fun unpublishTrack(trackSid: String, sendUnpublish: Boolean = false) {
         val publication = trackPublications[trackSid] as? RemoteTrackPublication ?: return
-        trackPublications = trackPublications.toMutableMap().apply { remove(trackSid) }
+        updateTrackPublications { remove(trackSid) }
 
         val track = publication.track
         if (track != null) {
@@ -261,3 +266,7 @@ class RemoteParticipant(
         eventBus.postEvent(ParticipantEvent.DataReceived(this, event.data, event.topic, event.encryptionType), scope)
     }
 }
+
+private const val MEDIA_TRACK_MAX_RETRIES = 20
+private val MEDIA_TRACK_RETRY_DELAYS_MS = listOf(10L, 20L, 40L, 80L)
+private const val MEDIA_TRACK_MAX_RETRY_DELAY_MS = 150L

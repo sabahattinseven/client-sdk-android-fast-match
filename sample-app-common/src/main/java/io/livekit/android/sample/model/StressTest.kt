@@ -1,5 +1,5 @@
 /*
- * Copyright 2024 LiveKit, Inc.
+ * Copyright 2024-2026 LiveKit, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -25,6 +25,18 @@ sealed class StressTest : Parcelable {
     data class SwitchRoom(
         val firstToken: String,
         val secondToken: String,
+    ) : StressTest()
+
+    /**
+     * Rapidly switches between two rooms via [io.livekit.android.room.Room.switchRoom]
+     * with persistent local media, emulating a fast-match skip loop.
+     */
+    @Parcelize
+    data class FastMatch(
+        val firstToken: String,
+        val secondToken: String,
+        val periodMs: Long = 400,
+        val cycles: Int = 500,
     ) : StressTest()
 
     @Parcelize

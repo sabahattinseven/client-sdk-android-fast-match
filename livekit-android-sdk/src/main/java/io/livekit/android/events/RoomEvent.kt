@@ -51,6 +51,24 @@ sealed class RoomEvent(val room: Room) : Event() {
     class Reconnected(room: Room) : RoomEvent(room)
 
     /**
+     * A switch to a different room has started via [Room.switchRoom].
+     *
+     * The room's remote participants are removed ([ParticipantDisconnected] is
+     * emitted for each), while locally published tracks and their capture
+     * pipelines are kept alive for the new room. The room never enters
+     * [Room.State.DISCONNECTED] and no [Disconnected] event is emitted.
+     */
+    class RoomSwitching(room: Room) : RoomEvent(room)
+
+    /**
+     * A switch started via [Room.switchRoom] has completed and the room is
+     * connected to the new room. Local tracks are republished automatically;
+     * the new room's participants arrive via [ParticipantConnected] and
+     * [TrackSubscribed] events.
+     */
+    class RoomSwitched(room: Room) : RoomEvent(room)
+
+    /**
      * Disconnected from room
      */
     class Disconnected(room: Room, val error: Exception?, val reason: DisconnectReason) : RoomEvent(room)

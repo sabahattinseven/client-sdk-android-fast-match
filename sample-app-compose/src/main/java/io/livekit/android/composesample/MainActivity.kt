@@ -1,5 +1,5 @@
 /*
- * Copyright 2023-2024 LiveKit, Inc.
+ * Copyright 2023-2026 LiveKit, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -131,6 +131,7 @@ class MainActivity : ComponentActivity() {
             var e2eeKey by remember { mutableStateOf(defaultE2eeKey) }
             var e2eeOn by remember { mutableStateOf(defaultE2eeOn) }
             var stressTest by remember { mutableStateOf(false) }
+            var fastMatchStress by remember { mutableStateOf(false) }
             var secondToken by remember { mutableStateOf(defaultSecondToken) }
             val scrollState = rememberScrollState()
             // A surface container using the 'background' color from the theme
@@ -179,14 +180,14 @@ class MainActivity : ComponentActivity() {
                             )
                         }
 
-                        if (stressTest) {
+                        if (stressTest || fastMatchStress) {
                             Spacer(modifier = Modifier.height(20.dp))
                             OutlinedTextField(
                                 value = secondToken,
                                 onValueChange = { secondToken = it },
                                 label = { Text("Second token") },
                                 modifier = Modifier.fillMaxWidth(),
-                                enabled = stressTest,
+                                enabled = stressTest || fastMatchStress,
                             )
                         }
 
@@ -211,17 +212,35 @@ class MainActivity : ComponentActivity() {
                             Text("Stress test")
                             Switch(
                                 checked = stressTest,
-                                onCheckedChange = { stressTest = it },
+                                onCheckedChange = {
+                                    stressTest = it
+                                    if (it) fastMatchStress = false
+                                },
+                            )
+                        }
+
+                        Row(
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically,
+                            modifier = Modifier.fillMaxWidth(),
+                        ) {
+                            Text("Fast-match stress")
+                            Switch(
+                                checked = fastMatchStress,
+                                onCheckedChange = {
+                                    fastMatchStress = it
+                                    if (it) stressTest = false
+                                },
                             )
                         }
 
                         Spacer(modifier = Modifier.height(40.dp))
                         Button(
                             onClick = {
-                                val stressTestCmd = if (stressTest) {
-                                    StressTest.SwitchRoom(token, secondToken)
-                                } else {
-                                    StressTest.None
+                                val stressTestCmd = when {
+                                    stressTest -> StressTest.SwitchRoom(token, secondToken)
+                                    fastMatchStress -> StressTest.FastMatch(token, secondToken)
+                                    else -> StressTest.None
                                 }
                                 onConnect(url, token, e2eeKey, e2eeOn, stressTestCmd)
                             },

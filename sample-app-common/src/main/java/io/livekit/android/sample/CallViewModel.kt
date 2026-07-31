@@ -21,6 +21,7 @@ import android.app.Application
 import android.content.Intent
 import android.media.projection.MediaProjectionManager
 import android.os.Build
+import android.os.SystemClock
 import androidx.annotation.OptIn
 import androidx.camera.camera2.interop.ExperimentalCamera2Interop
 import androidx.lifecycle.AndroidViewModel
@@ -208,6 +209,7 @@ class CallViewModel(
 
             when (stressTest) {
                 is StressTest.SwitchRoom -> launch { stressTest.execute() }
+                is StressTest.FastMatch -> launch { stressTest.execute() }
                 is StressTest.None -> connectToRoom()
             }
         }
@@ -491,6 +493,38 @@ class CallViewModel(
             room.disconnect()
             delay(50)
         }
+    }
+
+    private suspend fun StressTest.FastMatch.execute() = coroutineScope {
+        launch(Dispatchers.Default) {
+            while (isActive) {
+                delay(2000)
+                dumpReferenceTables()
+            }
+        }
+
+        room.keepLocalMediaOnDisconnect = true
+        LKLog.i { "FastMatch stress -> initial connect" }
+        quickConnectToRoom(firstToken)
+
+        var cycle = 0
+        while (isActive && cycle < cycles) {
+            delay(periodMs)
+            val token = if (cycle % 2 == 0) secondToken else firstToken
+            val startMs = SystemClock.elapsedRealtime()
+            val result = room.switchRoom(url, token)
+            LKLog.i {
+                "FastMatch stress -> switch #$cycle " +
+                    "result=${if (result.isSuccess) "ok" else "failed"} " +
+                    "took=${SystemClock.elapsedRealtime() - startMs}ms"
+            }
+            if (result.isFailure) {
+                LKLog.e(result.exceptionOrNull()) { "FastMatch stress switch failed, reconnecting" }
+                quickConnectToRoom(token)
+            }
+            cycle++
+        }
+        LKLog.i { "FastMatch stress complete: $cycle cycles" }
     }
 
     private suspend fun quickConnectToRoom(token: String) {

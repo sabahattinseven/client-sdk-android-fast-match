@@ -85,9 +85,13 @@ import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.CoroutineExceptionHandler
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Deferred
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.async
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.flow.filterNotNull
 import kotlinx.coroutines.flow.first
@@ -189,6 +193,12 @@ constructor(
         CONNECTED,
         DISCONNECTED,
         RECONNECTING,
+
+        /**
+         * Switching to a different room via [switchRoom]. Local media stays live;
+         * the room transitions to [CONNECTED] once the new room is joined.
+         */
+        SWITCHING,
     }
 
     /**
@@ -240,14 +250,13 @@ constructor(
         if (new != old) {
             when (new) {
                 State.CONNECTING -> {
-                    audioHandler.start()
-                    communicationWorkaround.start()
+                    startAudioSession()
                 }
 
                 State.DISCONNECTED -> {
-                    audioHandler.stop()
-                    communicationWorkaround.stop()
-                    audioRecordPrewarmer.stop()
+                    if (!keepLocalMediaOnDisconnect) {
+                        stopAudioSession()
+                    }
                 }
 
                 else -> {}
@@ -255,6 +264,27 @@ constructor(
         }
     }
         private set
+
+    private var audioSessionStarted = false
+
+    internal fun startAudioSession() {
+        if (audioSessionStarted) {
+            return
+        }
+        audioSessionStarted = true
+        audioHandler.start()
+        communicationWorkaround.start()
+    }
+
+    private fun stopAudioSession() {
+        if (!audioSessionStarted) {
+            return
+        }
+        audioSessionStarted = false
+        audioHandler.stop()
+        communicationWorkaround.stop()
+        audioRecordPrewarmer.stop()
+    }
 
     @FlowObservable
     @get:FlowObservable
@@ -288,6 +318,31 @@ constructor(
      * Defaults to false.
      */
     var adaptiveStream: Boolean = false
+
+    /**
+     * When true, locally created tracks (including the default camera/mic tracks),
+     * their capture pipelines, and the audio session (audio focus/mode) are kept
+     * alive when this room disconnects, so the next [connect] or [switchRoom] can
+     * reuse them without reopening the camera or rebuilding the audio session.
+     *
+     * Intended for rapid back-to-back calls (e.g. 1:1 match flows) using a single
+     * [Room] instance. While enabled, tracks provided by the app are treated as
+     * caller-owned and are not disposed on disconnect. Note that after a
+     * retained disconnect the SDK holds no publication referencing such a track —
+     * its capturer keeps running — so the app must keep its own reference and
+     * stop/dispose it when done. Only the default camera/mic tracks are tracked
+     * across matches and released by [release].
+     *
+     * Retained media is released by [release], or by setting this back to false
+     * before disconnecting.
+     *
+     * Defaults to false.
+     */
+    var keepLocalMediaOnDisconnect: Boolean = false
+        set(value) {
+            field = value
+            localParticipant.retainLocalMediaOnCleanup = value
+        }
 
     /**
      *  audio processing is enabled
@@ -448,6 +503,21 @@ constructor(
     }
 
     /**
+     * Pre-warms the connection (DNS resolution + TLS session) to [url] regardless
+     * of the current connection state. Unlike [prepareConnection], this works while
+     * connected — e.g. to warm up the next room's server during a fast-match
+     * session.
+     */
+    internal suspend fun warmConnection(url: String) {
+        try {
+            connectionWarmer.fetch(url)
+        } catch (e: Exception) {
+            e.rethrowIfCancellationSignal()
+            LKLog.e(e) { "Error while warming connection to $url:" }
+        }
+    }
+
+    /**
      * Connect to a LiveKit Room.
      *
      * @param url
@@ -556,27 +626,34 @@ constructor(
 
             ensureActive()
             networkCallbackManager.registerCallback()
-            if (options.audio) {
-                val audioTrack = localParticipant.getOrCreateDefaultAudioTrack()
-                audioTrack.prewarm()
-                var cancelPreconnect: (() -> Unit)? = null
+            // Audio and video publishes are independent; run them concurrently so
+            // neither's signal round-trip delays the other.
+            coroutineScope {
+                if (options.audio) {
+                    launch {
+                        val audioTrack = localParticipant.getOrCreateDefaultAudioTrack()
+                        audioTrack.prewarm()
+                        var cancelPreconnect: (() -> Unit)? = null
 
-                if (audioTrackPublishDefaults.preconnect) {
-                    cancelPreconnect = startPreconnectAudioJob(roomScope = coroutineScope)
+                        if (audioTrackPublishDefaults.preconnect) {
+                            cancelPreconnect = startPreconnectAudioJob(roomScope = this@Room.coroutineScope)
+                        }
+                        if (!localParticipant.publishAudioTrack(audioTrack)) {
+                            audioTrack.stop()
+                            audioTrack.stopPrewarm()
+                            cancelPreconnect?.invoke()
+                        }
+                    }
                 }
-                if (!localParticipant.publishAudioTrack(audioTrack)) {
-                    audioTrack.stop()
-                    audioTrack.stopPrewarm()
-                    cancelPreconnect?.invoke()
-                }
-            }
-            ensureActive()
-            if (options.video) {
-                val videoTrack = localParticipant.getOrCreateDefaultVideoTrack()
-                videoTrack.startCapture()
-                if (!localParticipant.publishVideoTrack(videoTrack)) {
-                    videoTrack.stopCapture()
-                    videoTrack.stop()
+                if (options.video) {
+                    launch {
+                        val videoTrack = localParticipant.getOrCreateDefaultVideoTrack()
+                        videoTrack.startCapture()
+                        if (!localParticipant.publishVideoTrack(videoTrack)) {
+                            videoTrack.stopCapture()
+                            videoTrack.stop()
+                        }
+                    }
                 }
             }
 
@@ -618,6 +695,123 @@ constructor(
         }
         engine.client.sendLeave()
         handleDisconnect(DisconnectReason.CLIENT_INITIATED)
+    }
+
+    private var switchJob: Job? = null
+
+    /**
+     * Serializes switch attempt bodies: an aborted attempt fully unwinds its engine
+     * teardown before the replacing attempt touches the engine.
+     */
+    private val switchMutex = Mutex()
+
+    @Volatile
+    private var pendingSwitch = false
+
+    /**
+     * Switches this room over to a different room without tearing down local media
+     * or the audio session.
+     *
+     * The current room's transport (signal connection and peer connections) is torn
+     * down and a fresh connection is made to the new room; locally published tracks
+     * are republished automatically without stopping their capture pipelines, so
+     * the camera never blinks. As with reconnection, publications that are muted at
+     * the time of the switch are not carried over; they are republished on unmute.
+     * Unlike [disconnect] + [connect], the room never enters [State.DISCONNECTED]
+     * and no [RoomEvent.Disconnected] is emitted.
+     *
+     * Best used together with [keepLocalMediaOnDisconnect] for rapid back-to-back
+     * 1:1 call flows.
+     *
+     * Callable from [State.CONNECTED], [State.RECONNECTING] and [State.SWITCHING];
+     * returns a failure [Result] if the room is disconnected (use [connect] instead)
+     * or if the initial [connect] is still in progress. Calling this while a
+     * previous switch is still in flight aborts the previous switch and starts the
+     * new one.
+     *
+     * If the switch fails, the room disconnects (with
+     * [RoomEvent.Disconnected] and reason [DisconnectReason.JOIN_FAILURE]); local
+     * media survives per [keepLocalMediaOnDisconnect] and a fresh [connect] may be
+     * attempted.
+     *
+     * Event order: [RoomEvent.RoomSwitching], then [RoomEvent.ParticipantDisconnected]
+     * for each old remote participant, then [RoomEvent.RoomSwitched] once connected,
+     * followed by the new room's participant and track events.
+     *
+     * @param url url to connect to
+     * @param token token for the new room
+     * @param options connect options for the new room, or the current options if null
+     */
+    suspend fun switchRoom(
+        url: String,
+        token: String,
+        options: ConnectOptions? = null,
+    ): Result<Unit> {
+        val job: Deferred<Unit>
+        stateLock.withLock {
+            when (state) {
+                State.DISCONNECTED ->
+                    return Result.failure(IllegalStateException("Room.switchRoom attempted while disconnected, use connect() instead."))
+
+                State.CONNECTING ->
+                    return Result.failure(IllegalStateException("Room.switchRoom attempted while the initial connect is still in progress."))
+
+                else -> {}
+            }
+            // Abort any in-flight switch. The switchMutex inside the impl guarantees
+            // the aborted attempt fully unwinds before the new one proceeds.
+            switchJob?.cancel()
+            options?.let { connectOptions = it }
+            state = State.SWITCHING
+            pendingSwitch = true
+            eventBus.postEvent(RoomEvent.RoomSwitching(this), coroutineScope)
+
+            job = coroutineScope.async(ioDispatcher) {
+                switchRoomImpl(url, token, coroutineContext.job)
+            }
+            switchJob = job
+        }
+
+        return try {
+            job.await()
+            Result.success(Unit)
+        } catch (e: CancellationException) {
+            currentCoroutineContext().ensureActive()
+            Result.failure(CancellationException("Switch was aborted by a newer switch or disconnect.", e))
+        } catch (e: Exception) {
+            Result.failure(e)
+        }
+    }
+
+    private suspend fun switchRoomImpl(url: String, token: String, myJob: Job) {
+        switchMutex.withLock {
+            try {
+                localParticipant.prepareForFullReconnect()
+                resetRoomStateForSwitch()
+
+                val roomOptions = getCurrentRoomOptions()
+                if (roomOptions.e2eeOptions != null) {
+                    e2eeManager = e2EEManagerFactory.create(roomOptions.e2eeOptions.keyProvider).apply {
+                        setup(this@Room) { event ->
+                            coroutineScope.launch {
+                                emitWhenConnected(event)
+                            }
+                        }
+                    }
+                    engine.e2EEManager = e2eeManager
+                }
+
+                engine.switchSession(url, token, connectOptions, roomOptions)
+                localParticipant.republishTracks()
+            } catch (e: Exception) {
+                e.rethrowIfCancellationSignal()
+                // Recovery must happen here in the switch job itself: the caller may
+                // have gone away. Guarded so a switch that was replaced can never
+                // tear down its successor.
+                handleDisconnect(DisconnectReason.JOIN_FAILURE, expectedSwitchJob = myJob)
+                throw e
+            }
+        }
     }
 
     /**
@@ -662,7 +856,14 @@ constructor(
      * must be created.
      */
     fun release() {
+        keepLocalMediaOnDisconnect = false
         disconnect()
+        // An earlier disconnect that retained local media leaves tracks and the
+        // audio session alive. Disposal is idempotent, so always run it rather
+        // than branching on a state snapshot that may race a concurrent
+        // connect/disconnect.
+        localParticipant.dispose()
+        stopAudioSession()
         closeableManager.close()
     }
 
@@ -996,23 +1197,44 @@ constructor(
     }
 
     private fun reconnect() {
-        if (state == State.RECONNECTING) {
+        if (state == State.RECONNECTING || state == State.SWITCHING) {
             return
         }
         engine.reconnect()
     }
 
-    private fun handleDisconnect(reason: DisconnectReason) {
+    private fun handleDisconnect(reason: DisconnectReason, expectedSwitchJob: Job? = null) {
         if (state == State.DISCONNECTED) {
             return
         }
         runBlocking {
+            if (expectedSwitchJob == null) {
+                // Abort any in-flight switch before tearing down, outside the state
+                // lock: the aborted switch's own failure recovery re-enters here and
+                // needs the lock to run to completion.
+                //
+                // Invariant: this join must never run on the switch job's own call
+                // stack (self-join deadlock). Engine listener callbacks that lead
+                // here (e.g. onEngineDisconnected) are dispatched from engine/signal
+                // coroutines, never invoked synchronously from within switchSession;
+                // preserve that when changing engine callback dispatch.
+                switchJob?.let {
+                    it.cancel()
+                    it.join()
+                }
+            }
             stateLock.withLock {
                 if (state == State.DISCONNECTED) {
                     return@runBlocking
                 }
+                if (expectedSwitchJob != null && switchJob !== expectedSwitchJob) {
+                    // This switch was replaced; its successor owns the room now.
+                    return@runBlocking
+                }
                 networkCallbackManager.unregisterCallback()
                 hasLostConnectivity = false
+                pendingSwitch = false
+                switchJob = null
 
                 state = State.DISCONNECTED
                 cleanupRoom()
@@ -1034,6 +1256,20 @@ constructor(
         e2eeManager?.dispose()
         e2eeManager = null
         localParticipant.cleanup()
+        cleanupRemoteParticipantsAndRoomInfo()
+    }
+
+    /**
+     * Clears per-room state (remote participants, room info, data streams) while
+     * leaving the local participant's publications and tracks untouched.
+     */
+    private fun resetRoomStateForSwitch() {
+        e2eeManager?.dispose()
+        e2eeManager = null
+        cleanupRemoteParticipantsAndRoomInfo()
+    }
+
+    private fun cleanupRemoteParticipantsAndRoomInfo() {
         remoteParticipants.keys.toMutableSet() // copy keys to avoid concurrent modifications.
             .forEach { sid -> handleParticipantDisconnect(sid) }
 
@@ -1043,6 +1279,7 @@ constructor(
         isRecording = false
         sidToIdentity.clear()
         incomingDataStreamManager.clearOpenStreams()
+        transcriptionReceivedTimes.clear()
     }
 
     private fun sendSyncState() {
@@ -1180,7 +1417,12 @@ constructor(
      */
     override fun onEngineConnected() {
         state = State.CONNECTED
-        eventBus.postEvent(RoomEvent.Connected(this), coroutineScope)
+        if (pendingSwitch) {
+            pendingSwitch = false
+            eventBus.postEvent(RoomEvent.RoomSwitched(this), coroutineScope)
+        } else {
+            eventBus.postEvent(RoomEvent.Connected(this), coroutineScope)
+        }
     }
 
     /**

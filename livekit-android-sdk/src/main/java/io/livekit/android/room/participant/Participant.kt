@@ -344,10 +344,21 @@ open class Participant(
     /**
      * @suppress
      */
+    /**
+     * Atomically mutates the [trackPublications] map. All read-modify-write updates
+     * of the map must go through here — the copy-on-write pattern loses updates
+     * under concurrent mutation otherwise (e.g. audio and video publishing
+     * concurrently on connect).
+     */
+    @Synchronized
+    internal fun updateTrackPublications(mutator: MutableMap<String, TrackPublication>.() -> Unit) {
+        trackPublications = trackPublications.toMutableMap().apply(mutator)
+    }
+
     fun addTrackPublication(publication: TrackPublication) {
         val track = publication.track
         track?.sid = publication.sid
-        trackPublications = trackPublications.toMutableMap().apply {
+        updateTrackPublications {
             this[publication.sid] = publication
         }
     }

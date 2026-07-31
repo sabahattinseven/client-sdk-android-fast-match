@@ -62,6 +62,7 @@ import io.livekit.android.util.LKLog
 import io.livekit.android.util.flow
 import io.livekit.android.util.rethrowIfCancellationSignal
 import io.livekit.android.webrtc.sortVideoCodecPreferences
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.async
@@ -137,8 +138,15 @@ internal constructor(
 
     internal val enabledPublishVideoCodecs = Collections.synchronizedList(mutableListOf<Codec>())
 
-    private var defaultAudioTrack: LocalAudioTrack? = null
-    private var defaultVideoTrack: LocalVideoTrack? = null
+    internal var defaultAudioTrack: LocalAudioTrack? = null
+    internal var defaultVideoTrack: LocalVideoTrack? = null
+
+    /**
+     * When true, [cleanup] unpublishes tracks but keeps them (and their capturers)
+     * alive so they can be republished on the next connection. See
+     * [Room.keepLocalMediaOnDisconnect].
+     */
+    internal var retainLocalMediaOnCleanup: Boolean = false
 
     internal fun reinitialize(connectOptions: ConnectOptions) {
         reinitialize()
@@ -953,7 +961,7 @@ internal constructor(
         }
 
         val sid = publication.sid
-        trackPublications = trackPublications.toMutableMap().apply { remove(sid) }
+        updateTrackPublications { remove(sid) }
 
         if (engine.connectionState == ConnectionState.CONNECTED) {
             engine.removeTrack(track.rtcTrack)
@@ -1271,14 +1279,17 @@ internal constructor(
     }
 
     internal fun prepareForFullReconnect() {
-        val pubs = localTrackPublications.toList() // creates a copy, so is safe from the following removal.
-
-        // Only set the first time we start a full reconnect.
-        if (republishes == null) {
-            republishes = pubs
+        var pubs: List<LocalTrackPublication> = emptyList()
+        updateTrackPublications {
+            pubs = values.mapNotNull { it as? LocalTrackPublication }
+            clear()
         }
 
-        trackPublications = trackPublications.toMutableMap().apply { clear() }
+        // Merge with any tracks still parked from an earlier aborted attempt, so
+        // repeated reconnects/switches never lose a publication.
+        val parked = republishes.orEmpty()
+        val parkedTracks = parked.mapNotNull { it.track }.toSet()
+        republishes = parked + pubs.filter { it.track !in parkedTracks }
 
         for (publication in pubs) {
             internalListener?.onTrackUnpublished(publication, this)
@@ -1287,23 +1298,35 @@ internal constructor(
     }
 
     internal suspend fun republishTracks() {
-        val publish = republishes?.toList() ?: emptyList()
+        val remaining = republishes?.toMutableList() ?: mutableListOf()
         republishes = null
 
-        for (pub in publish) {
-            val track = pub.track ?: continue
-            unpublishTrack(track, false)
-            // Cannot publish muted tracks.
-            if (!pub.muted) {
-                val success = when (track) {
-                    is LocalAudioTrack -> publishAudioTrack(track, pub.options as AudioTrackPublishOptions, null)
-                    is LocalVideoTrack -> publishVideoTrack(track, pub.options as VideoTrackPublishOptions, null)
-                    else -> throw IllegalStateException("LocalParticipant has a non local track publish?")
-                }
-                if (!success) {
-                    track.stop()
-                }
+        try {
+            while (remaining.isNotEmpty()) {
+                republishTrack(remaining.first())
+                remaining.removeAt(0)
             }
+        } catch (e: CancellationException) {
+            // Re-park the unfinished remainder so the next attempt republishes it.
+            republishes = remaining.toList()
+            throw e
+        }
+    }
+
+    private suspend fun republishTrack(pub: LocalTrackPublication) {
+        val track = pub.track ?: return
+        unpublishTrack(track, false)
+        // Cannot publish muted tracks.
+        if (pub.muted) {
+            return
+        }
+        val success = when (track) {
+            is LocalAudioTrack -> publishAudioTrack(track, pub.options as AudioTrackPublishOptions, null)
+            is LocalVideoTrack -> publishVideoTrack(track, pub.options as VideoTrackPublishOptions, null)
+            else -> throw IllegalStateException("LocalParticipant has a non local track publish?")
+        }
+        if (!success) {
+            track.stop()
         }
     }
 
@@ -1334,54 +1357,41 @@ internal constructor(
      * @suppress
      */
     fun cleanup() {
+        if (retainLocalMediaOnCleanup) {
+            cleanupRetainingLocalMedia()
+        } else {
+            cleanupReleasingLocalMedia()
+        }
+    }
+
+    private fun cleanupReleasingLocalMedia() {
         for (pub in trackPublications.values) {
-            val track = pub.track
+            val track = pub.track ?: continue
 
-            if (track != null) {
-                // Stopping and unpublishing go through the engine and the webrtc layer, either
-                // of which can throw if the underlying objects were already released. Cleanup
-                // must carry on to the remaining tracks regardless.
-                try {
-                    track.stop()
-                    unpublishTrack(track, stopOnUnpublish = false)
-                } catch (e: Exception) {
-                    LKLog.d(e) { "Exception thrown when unpublishing local participant track $pub:" }
-                }
+            // Stopping and unpublishing go through the engine and the webrtc layer, either
+            // of which can throw if the underlying objects were already released. Cleanup
+            // must carry on to the remaining tracks regardless.
+            try {
+                track.stop()
+                unpublishTrack(track, stopOnUnpublish = false)
+            } catch (e: Exception) {
+                LKLog.d(e) { "Exception thrown when unpublishing local participant track $pub:" }
+            }
 
-                // We have the original track object reference, meaning we own it. Dispose here.
-                try {
-                    track.dispose()
-                    if (track === defaultAudioTrack) {
-                        defaultAudioTrack = null
-                    } else if (track === defaultVideoTrack) {
-                        defaultVideoTrack = null
-                    }
-                } catch (e: Exception) {
-                    LKLog.d(e) { "Exception thrown when cleaning up local participant track $pub:" }
+            // We have the original track object reference, meaning we own it. Dispose here.
+            try {
+                track.dispose()
+                if (track === defaultAudioTrack) {
+                    defaultAudioTrack = null
+                } else if (track === defaultVideoTrack) {
+                    defaultVideoTrack = null
                 }
+            } catch (e: Exception) {
+                LKLog.d(e) { "Exception thrown when cleaning up local participant track $pub:" }
             }
         }
 
-        // Dispose tracks that were saved for republishing but never got republished.
-        // This happens when reconnection fails after prepareForFullReconnect() was called.
-        val republishesToDispose = republishes?.toList() ?: emptyList()
-        for (pub in republishesToDispose) {
-            val track = pub.track
-            if (track != null) {
-                try {
-                    track.stop()
-                } catch (e: Exception) {
-                    LKLog.d(e) { "Exception stopping republish track:" }
-                }
-
-                try {
-                    track.dispose()
-                } catch (e: Exception) {
-                    LKLog.d(e) { "Exception disposing republish track:" }
-                }
-            }
-        }
-        republishes = null
+        disposeUnrepublishedTracks()
 
         try {
             defaultAudioTrack?.dispose()
@@ -1395,6 +1405,48 @@ internal constructor(
         }
         defaultAudioTrack = null
         defaultVideoTrack = null
+    }
+
+    /**
+     * Disposes tracks that were saved for republishing but never got republished.
+     * This happens when reconnection fails after prepareForFullReconnect() was called.
+     */
+    private fun disposeUnrepublishedTracks() {
+        val republishesToDispose = republishes?.toList() ?: emptyList()
+        for (pub in republishesToDispose) {
+            val track = pub.track ?: continue
+            try {
+                track.stop()
+            } catch (e: Exception) {
+                LKLog.d(e) { "Exception stopping republish track:" }
+            }
+
+            try {
+                track.dispose()
+            } catch (e: Exception) {
+                LKLog.d(e) { "Exception disposing republish track:" }
+            }
+        }
+        republishes = null
+    }
+
+    /**
+     * Unpublishes all tracks without stopping or disposing them, keeping the capture
+     * pipeline (camera/mic) hot for the next connection. Tracks are only released by
+     * a later [cleanup] with [retainLocalMediaOnCleanup] disabled.
+     *
+     * Non-default tracks provided by the app are treated as caller-owned in this mode.
+     */
+    private fun cleanupRetainingLocalMedia() {
+        for (pub in trackPublications.values) {
+            val track = pub.track ?: continue
+            try {
+                unpublishTrack(track, stopOnUnpublish = false)
+            } catch (e: Exception) {
+                LKLog.d(e) { "Exception thrown when unpublishing local participant track $pub:" }
+            }
+        }
+        republishes = null
     }
 
     /**

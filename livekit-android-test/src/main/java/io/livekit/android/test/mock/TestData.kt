@@ -1,5 +1,5 @@
 /*
- * Copyright 2023-2025 LiveKit, Inc.
+ * Copyright 2023-2026 LiveKit, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -174,6 +174,61 @@ object TestData {
             sdp = "remote_offer"
             type = "offer"
             id = 99
+            build()
+        }
+        build()
+    }
+
+    val REMOTE_AUDIO_TRACK_B = with(LivekitModels.TrackInfo.newBuilder()) {
+        sid = "TR_remote_audio_track_b_sid"
+        type = LivekitModels.TrackType.AUDIO
+        source = LivekitModels.TrackSource.MICROPHONE
+        build()
+    }
+
+    val REMOTE_VIDEO_TRACK_B = with(LivekitModels.TrackInfo.newBuilder()) {
+        sid = "TR_remote_video_track_b_sid"
+        type = LivekitModels.TrackType.VIDEO
+        source = LivekitModels.TrackSource.CAMERA
+        build()
+    }
+
+    val REMOTE_PARTICIPANT_B = with(REMOTE_PARTICIPANT.toBuilder()) {
+        sid = "remote_participant_b_sid"
+        identity = "remote_participant_b_identity"
+        metadata = "remote_b_metadata"
+        clearTracks()
+        addTracks(REMOTE_AUDIO_TRACK_B)
+        addTracks(REMOTE_VIDEO_TRACK_B)
+        build()
+    }
+
+    /**
+     * A join response for a different room, for room switching tests.
+     */
+    fun joinResponse(
+        roomName: String = "room_b_name",
+        otherParticipants: List<LivekitModels.ParticipantInfo> = listOf(REMOTE_PARTICIPANT_B),
+    ): LivekitRtc.SignalResponse = with(JOIN.toBuilder()) {
+        join = with(join.toBuilder()) {
+            room = with(room.toBuilder()) {
+                name = roomName
+                build()
+            }
+            clearOtherParticipants()
+            addAllOtherParticipants(otherParticipants)
+            build()
+        }
+        build()
+    }
+
+    val JOIN_B = joinResponse()
+
+    val OFFER_B = with(LivekitRtc.SignalResponse.newBuilder()) {
+        offer = with(LivekitRtc.SessionDescription.newBuilder()) {
+            sdp = "remote_offer_b"
+            type = "offer"
+            id = 100
             build()
         }
         build()

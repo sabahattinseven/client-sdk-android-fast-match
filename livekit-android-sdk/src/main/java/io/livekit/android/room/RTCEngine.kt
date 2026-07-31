@@ -276,6 +276,58 @@ internal constructor(
         return@coroutineScope joinResponse
     }
 
+    /**
+     * Tears down the current session's transport (peer connections, data channels,
+     * signal socket) and joins a new session with the given credentials, without
+     * passing through the DISCONNECTED state. Local track objects are untouched;
+     * the caller is responsible for republishing them.
+     */
+    internal suspend fun switchSession(
+        url: String,
+        token: String,
+        options: ConnectOptions,
+        roomOptions: RoomOptions,
+    ): JoinResponse {
+        LKLog.v { "Switching session to new room" }
+        // Suppress reconnect attempts while the old transport is torn down, and wait
+        // for any in-flight reconnect to fully unwind before touching the transport.
+        isClosed = true
+        try {
+            reconnectingJob?.let {
+                it.cancel()
+                it.join()
+            }
+            reconnectingJob = null
+            fullReconnectOnNext = false
+            abortPendingPublishTracks()
+            coroutineScope.close()
+            coroutineScope = CloseableCoroutineScope(SupervisorJob() + ioDispatcher)
+            closeResources("Switching room")
+            synchronized(reliableStateLock) {
+                reliableDataSequence = 1
+                reliableMessageBuffer.clear()
+                reliableReceivedState.clear()
+            }
+            hasPublished = false
+            participantSid = null
+            sessionUrl = url
+            sessionToken = token
+            connectOptions = options
+            lastRoomOptions = roomOptions
+            // CONNECTED -> CONNECTING has no delegate side effects; going through
+            // DISCONNECTED would trigger an automatic reconnect.
+            connectionState = ConnectionState.CONNECTING
+            return joinImpl(url, token, options, roomOptions)
+        } catch (e: Throwable) {
+            // joinImpl resets isClosed only on success; restore closability so a
+            // subsequent close() can reclaim whatever this attempt left open —
+            // including old peer connections if the switch was cancelled at the
+            // reconnectingJob join, before closeResources ran.
+            isClosed = false
+            throw e
+        }
+    }
+
     private suspend fun configure(joinResponse: JoinResponse, connectOptions: ConnectOptions) {
         launchBlockingOnRTCThread(rtcThreadToken) {
             configurationLock.withCheckLock(
