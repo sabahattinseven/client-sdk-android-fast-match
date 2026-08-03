@@ -120,7 +120,7 @@ constructor(
     internal val simulcastTransceivers: List<RtpTransceiver>
         get() = simulcastCodecs.values.mapNotNull { it.transceiver }
 
-    private val closeableManager = CloseableManager()
+    internal val closeableManager = CloseableManager()
 
     private val disposed = AtomicBoolean(false)
 
