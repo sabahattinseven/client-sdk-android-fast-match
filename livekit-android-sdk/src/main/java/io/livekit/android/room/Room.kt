@@ -76,10 +76,12 @@ import io.livekit.android.room.types.toSDKType
 import io.livekit.android.room.util.ConnectionWarmer
 import io.livekit.android.util.FlowObservable
 import io.livekit.android.util.LKLog
+import io.livekit.android.util.TimeoutException
 import io.livekit.android.util.flow
 import io.livekit.android.util.flowDelegate
 import io.livekit.android.util.invoke
 import io.livekit.android.util.rethrowIfCancellationSignal
+import io.livekit.android.util.withDeadline
 import io.livekit.android.webrtc.getFilteredStats
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineDispatcher
@@ -115,6 +117,7 @@ import java.net.URI
 import java.util.Date
 import javax.inject.Named
 import kotlin.time.Duration
+import kotlin.time.Duration.Companion.seconds
 
 class Room
 @AssistedInject
@@ -657,11 +660,7 @@ constructor(
                 }
             }
 
-            coroutineScope.launch {
-                if (enableMetrics) {
-                    collectMetrics(room = this@Room, rtcEngine = engine)
-                }
-            }
+            startMetricsCollection()
         }
 
         val outerHandler = coroutineContext.job.invokeOnCompletion { cause ->
@@ -698,6 +697,36 @@ constructor(
     }
 
     private var switchJob: Job? = null
+
+    private var metricsJob: Job? = null
+
+    private fun startMetricsCollection() {
+        if (!enableMetrics) {
+            return
+        }
+        metricsJob = coroutineScope.launch {
+            collectMetrics(room = this@Room, rtcEngine = engine)
+        }
+    }
+
+    /**
+     * Stops metrics collection and waits (bounded) for any in-flight native stats
+     * request to deliver its report. Must run before the peer connections are
+     * disposed — a native stats request completing against a disposed connection
+     * crashes on the webrtc network thread.
+     */
+    private suspend fun stopMetricsCollection() {
+        val job = metricsJob ?: return
+        metricsJob = null
+        job.cancel()
+        try {
+            withDeadline(1.seconds) {
+                job.join()
+            }
+        } catch (e: TimeoutException) {
+            LKLog.w(e) { "Timed out waiting for metrics collection to stop." }
+        }
+    }
 
     /**
      * Serializes switch attempt bodies: an aborted attempt fully unwinds its engine
@@ -801,8 +830,10 @@ constructor(
                     engine.e2EEManager = e2eeManager
                 }
 
+                stopMetricsCollection()
                 engine.switchSession(url, token, connectOptions, roomOptions)
                 localParticipant.republishTracks()
+                startMetricsCollection()
             } catch (e: Exception) {
                 e.rethrowIfCancellationSignal()
                 // Recovery must happen here in the switch job itself: the caller may
@@ -1235,6 +1266,7 @@ constructor(
                 hasLostConnectivity = false
                 pendingSwitch = false
                 switchJob = null
+                stopMetricsCollection()
 
                 state = State.DISCONNECTED
                 cleanupRoom()

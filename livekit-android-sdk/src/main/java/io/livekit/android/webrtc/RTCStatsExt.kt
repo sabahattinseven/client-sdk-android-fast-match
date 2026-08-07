@@ -1,5 +1,5 @@
 /*
- * Copyright 2023-2025 LiveKit, Inc.
+ * Copyright 2023-2026 LiveKit, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -17,12 +17,12 @@
 package io.livekit.android.webrtc
 
 import io.livekit.android.util.LKLog
-import kotlinx.coroutines.suspendCancellableCoroutine
 import livekit.org.webrtc.MediaStreamTrack
 import livekit.org.webrtc.RTCStats
 import livekit.org.webrtc.RTCStatsCollectorCallback
 import livekit.org.webrtc.RTCStatsReport
 import kotlin.coroutines.resume
+import kotlin.coroutines.suspendCoroutine
 
 /**
  * Returns an RTCStatsReport with all the relevant information pertaining to a track.
@@ -163,7 +163,15 @@ private fun getExtraStats(
 
 typealias RTCStatsGetter = (RTCStatsCollectorCallback) -> Unit
 
-suspend fun RTCStatsGetter.getStats(): RTCStatsReport = suspendCancellableCoroutine { cont ->
+/**
+ * Awaits a stats report from this getter.
+ *
+ * Deliberately non-cancellable: the native stats request is already executing
+ * against the peer connection, and abandoning the wait would allow teardown to
+ * dispose the connection underneath it. Cancellation takes effect once the
+ * report is delivered.
+ */
+suspend fun RTCStatsGetter.getStats(): RTCStatsReport = suspendCoroutine { cont ->
     val listener = RTCStatsCollectorCallback { report ->
         cont.resume(report)
     }
