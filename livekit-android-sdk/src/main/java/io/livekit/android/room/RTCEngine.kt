@@ -128,6 +128,7 @@ internal constructor(
      * When the current connection attempt began, taken at the top of [joinImpl]. Cleared once the
      * primary transport connects, so the attempt is timed exactly once.
      */
+    @Volatile
     private var connectStartedAtMs: Long? = null
 
     /**
@@ -309,8 +310,9 @@ internal constructor(
         // case video is published before the primary transport connects.
         publisher?.setConnectStartedAt(startedAtMs)
 
-        // create offer
-        if (!isSubscriberPrimary || joinResponse.fastPublish) {
+        // After a full reconnect `hasPublished` is still set and the reconnect loop waits on
+        // publisher ICE, so negotiate here or that wait stalls when fastPublish is unset.
+        if (!isSubscriberPrimary || joinResponse.fastPublish || hasPublished) {
             negotiatePublisher()
         }
         client.onReadyForResponses()
@@ -562,6 +564,7 @@ internal constructor(
             drainInFlightJobs(oldScope, excluding = reconnectJob)
         }
         hasPublished = false
+        connectStartedAtMs = null
         sessionUrl = null
         sessionToken = null
         connectOptions = null
